@@ -12,3 +12,8 @@ https://huggingface.co/datasets/mkd-chanwoo/keural-rag-chatml-ko
 https://huggingface.co/datasets/junidude14/korean_roleplay_dataset_for_chat_game_2
 https://huggingface.co/datasets/developer-lunark/korean-character-roleplay-sft
 https://github.com/HeegyuKim/open-korean-instructions
+
+# pretraining
+
+https://huggingface.co/datasets/HuggingFaceFW/fineweb-2 (config: kor_Hang)
+https://huggingface.co/datasets/wikimedia/wikipedia (config: 20231101.ko)
