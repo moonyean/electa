@@ -1,0 +1,4 @@
+# Python 3.12-3.14. CUDA PyTorch is installed separately by scripts/server.py.
+numpy==2.5.2
+sentencepiece==0.2.2
+tqdm==4.68.3

@@ -17,12 +17,20 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import heapq
+import sys
 import json
 import os
 import random
 from pathlib import Path
 
 import sentencepiece as spm
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.utils.artifacts import file_identity, save_state
+
+MAX_SENTENCE_BYTES = 4096
 
 
 def open_jsonl(path: Path):
@@ -44,10 +52,7 @@ def get_input_files(input_dir: Path, seed: int) -> list[Path]:
 
 def write_checkpoint(checkpoint_path: Path, state: dict) -> None:
     """체크포인트를 임시 파일에 쓴 뒤 원자적으로 교체한다."""
-    temporary_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
-    with temporary_path.open("w", encoding="utf-8") as file:
-        json.dump(state, file, ensure_ascii=False, indent=2)
-    temporary_path.replace(checkpoint_path)
+    save_state(checkpoint_path, state)
 
 
 def load_checkpoint(checkpoint_path: Path) -> dict | None:
@@ -56,6 +61,56 @@ def load_checkpoint(checkpoint_path: Path) -> dict | None:
         return None
     with checkpoint_path.open("r", encoding="utf-8") as file:
         return json.load(file)
+
+
+def sentence_chunks(text: str, max_bytes: int = MAX_SENTENCE_BYTES):
+    """UTF-8 문자 경계를 유지하며 SentencePiece 입력 길이 이내로 분할한다."""
+    if max_bytes < 4:
+        raise ValueError("max_bytes는 4 이상이어야 합니다.")
+    chunk, size = [], 0
+    for char in text.replace("\n", " ").replace("\r", " "):
+        width = len(char.encode("utf-8"))
+        if size + width > max_bytes:
+            yield "".join(chunk)
+            chunk, size = [], 0
+        chunk.append(char)
+        size += width
+    if chunk:
+        yield "".join(chunk)
+
+
+def sample_shard(path: Path, documents: int, characters: int, seed: int):
+    """샤드 전체에서 난수 우선순위로 표본을 유지하며 메모리를 문자 예산으로 제한한다.
+
+    샤드별 동일 예산의 층화 표본이다. 예산 경계 문서는 일부만 포함될 수 있다.
+    """
+    rng = random.Random(seed)
+    heap = []
+    used = eligible = 0
+    with open_jsonl(path) as source:
+        for line_number, line in enumerate(source):
+            record = json.loads(line)
+            text = record.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            eligible += 1
+            if not documents or not characters:
+                continue
+            text = text.strip()[:characters]
+            item = (-rng.random(), line_number, text)
+            heapq.heappush(heap, item)
+            used += len(text)
+            if len(heap) > documents:
+                used -= len(heapq.heappop(heap)[2])
+            while used > characters:
+                priority, number, value = heapq.heappop(heap)
+                excess = used - characters
+                used -= len(value)
+                if len(value) > excess:
+                    value = value[:-excess]
+                    heapq.heappush(heap, (priority, number, value))
+                    used += len(value)
+    return [item[2] for item in sorted(heap, reverse=True)], eligible
 
 
 def build_corpus(
@@ -67,97 +122,68 @@ def build_corpus(
     seed: int,
     rebuild: bool = False,
 ) -> tuple[int, int]:
-    """샤드를 순회해 학습용 텍스트를 만들고 샤드마다 진행 상황을 저장한다."""
+    """모든 샤드에 예산을 나누고 완료된 샤드부터 재개한다."""
     if max_documents <= 0 or max_characters <= 0:
         raise ValueError("max_documents와 max_characters는 양수여야 합니다.")
-
     files = get_input_files(input_dir, seed)
     corpus_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if rebuild:
-        for path in (corpus_path, checkpoint_path):
-            if path.exists():
-                path.unlink()
-
-    state = load_checkpoint(checkpoint_path)
-    file_names = [str(path.resolve()) for path in files]
-    start_index = 0
-    document_count = 0
-    character_count = 0
-    corpus_bytes = 0
-
+    settings = {
+        "files": [file_identity(path) for path in files],
+        "seed": seed, "max_documents": max_documents, "max_characters": max_characters,
+        "corpus": str(corpus_path.resolve()), "max_sentence_bytes": MAX_SENTENCE_BYTES,
+        "sampling": "stratified_priority_v1",
+    }
+    state = None if rebuild else load_checkpoint(checkpoint_path)
     if state is not None:
-        if state.get("files") != file_names or state.get("seed") != seed:
-            raise RuntimeError(
-                "기존 체크포인트의 입력 파일 또는 seed가 현재 실행과 다릅니다. "
-                "--rebuild-corpus로 새로 시작하세요."
-            )
-        if state.get("completed", False):
-            print(f"완료된 학습용 말뭉치를 재사용합니다: {corpus_path}")
-            return int(state["documents"]), int(state["characters"])
-        if not corpus_path.exists():
-            raise FileNotFoundError("체크포인트는 있지만 학습용 말뭉치 파일이 없습니다.")
+        if state.get("version") != 2 or state.get("settings") != settings:
+            raise RuntimeError("corpus 입력/설정이 다릅니다. --rebuild-corpus가 필요합니다.")
+        if not corpus_path.exists() or corpus_path.stat().st_size < state["corpus_bytes"]:
+            raise RuntimeError("corpus가 없거나 체크포인트보다 짧습니다. 재생성이 필요합니다.")
+        if state["completed"]:
+            if file_identity(corpus_path) != state["corpus_identity"]:
+                raise RuntimeError("완료된 corpus가 변경되었습니다.")
+            return state["documents"], state["characters"]
+        with corpus_path.open("r+b") as output:
+            output.truncate(state["corpus_bytes"])
+    else:
+        if corpus_path.exists() and not rebuild:
+            raise FileExistsError("체크포인트 없는 corpus를 덮어쓰지 않습니다. --rebuild-corpus를 사용하세요.")
+        with corpus_path.open("wb"):
+            pass
+        state = {"version": 2, "settings": settings, "next_file_index": 0,
+                 "documents": 0, "characters": 0, "lines": 0, "corpus_bytes": 0,
+                 "completed": False, "shards": []}
+        write_checkpoint(checkpoint_path, state)
 
-        # 이전 샤드까지 확실히 저장된 위치로 잘라서 중간 샤드의 부분 기록을 제거한다.
-        corpus_bytes = int(state["corpus_bytes"])
-        with corpus_path.open("r+b") as file:
-            file.truncate(corpus_bytes)
-        start_index = int(state["next_file_index"])
-        document_count = int(state["documents"])
-        character_count = int(state["characters"])
-        print(f"체크포인트에서 재개: {start_index}/{len(files)}개 샤드 완료")
-
-    mode = "a" if start_index > 0 else "w"
-    with corpus_path.open(mode, encoding="utf-8", newline="\n") as output:
-        for file_index in range(start_index, len(files)):
-            path = files[file_index]
-            print(f"[{file_index + 1}/{len(files)}] 처리 중: {path.name}", flush=True)
-            with open_jsonl(path) as source:
-                for line in source:
-                    if document_count >= max_documents or character_count >= max_characters:
-                        output.flush()
-                        state = {
-                            "version": 1,
-                            "completed": True,
-                            "files": file_names,
-                            "seed": seed,
-                            "next_file_index": file_index,
-                            "documents": document_count,
-                            "characters": character_count,
-                            "corpus_bytes": corpus_path.stat().st_size,
-                        }
-                        write_checkpoint(checkpoint_path, state)
-                        return document_count, character_count
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    text = str(record.get("text", "")).strip()
-                    if not text:
-                        continue
-                    text = text[: max_characters - character_count]
-                    output.write(text.replace("\n", " ") + "\n")
-                    document_count += 1
-                    character_count += len(text)
-
-            # 샤드 하나가 끝날 때마다 안전한 복구 지점을 남긴다.
+    for index in range(state["next_file_index"], len(files)):
+        doc_budget = max_documents // len(files) + (index < max_documents % len(files))
+        char_budget = max_characters // len(files) + (index < max_characters % len(files))
+        print(f"[{index + 1}/{len(files)}] 전체 샤드에서 표본 추출: {files[index].name}", flush=True)
+        samples, eligible = sample_shard(files[index], doc_budget, char_budget, seed + index)
+        count_chars = count_lines = 0
+        with corpus_path.open("a", encoding="utf-8", newline="\n") as output:
+            for text in samples:
+                for chunk in sentence_chunks(text):
+                    output.write(chunk + "\n")
+                    count_lines += 1
+                count_chars += len(text)
             output.flush()
-            state = {
-                "version": 1,
-                "completed": False,
-                "files": file_names,
-                "seed": seed,
-                "next_file_index": file_index + 1,
-                "documents": document_count,
-                "characters": character_count,
-                "corpus_bytes": corpus_path.stat().st_size,
-            }
-            write_checkpoint(checkpoint_path, state)
-
+            os.fsync(output.fileno())
+        state["documents"] += len(samples)
+        state["characters"] += count_chars
+        state["lines"] += count_lines
+        state["next_file_index"] = index + 1
+        state["corpus_bytes"] = corpus_path.stat().st_size
+        state["shards"].append({"file": str(files[index]), "eligible": eligible,
+                                "sampled": len(samples), "characters": count_chars})
+        write_checkpoint(checkpoint_path, state)
+    if not state["documents"]:
+        raise RuntimeError("학습에 사용할 문서가 없습니다.")
     state["completed"] = True
+    state["corpus_identity"] = file_identity(corpus_path)
     write_checkpoint(checkpoint_path, state)
-    return document_count, character_count
+    return state["documents"], state["characters"]
 
 
 def train_tokenizer(
@@ -182,10 +208,20 @@ def train_tokenizer(
         if path.exists():
             path.unlink()
 
+    lines = 0
+    with corpus_path.open("rb") as source:
+        for line in source:
+            if len(line.rstrip(b"\r\n")) > MAX_SENTENCE_BYTES:
+                raise ValueError("corpus에 길이 제한 초과 줄이 있습니다. 새 corpus가 필요합니다.")
+            lines += 1
+    if not lines:
+        raise ValueError("빈 corpus로 학습할 수 없습니다.")
+    print(f"SentencePiece 입력: {lines:,}줄, 길이 초과 0줄", flush=True)
     spm.SentencePieceTrainer.train(
         input=str(corpus_path),
         model_prefix=str(temporary_prefix),
         model_type="unigram",
+        max_sentence_length=MAX_SENTENCE_BYTES,
         vocab_size=vocab_size,
         character_coverage=character_coverage,
         byte_fallback=True,

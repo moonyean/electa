@@ -6,3 +6,13 @@ __pycache__/
 /logs
 .ipynb_checkpoints/
 .venv/
+.venv-server/
+/.training.lock
+/.server-session.json
+/.server-stop
+/server_bundle_manifest.json
+/.upload-*/
+
+/scripts/server.py
+/docs/server_training.md
+/dist/

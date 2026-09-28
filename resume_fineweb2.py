@@ -3,22 +3,27 @@
 재개용 스크립트. 조각을 잘게 쪼개서 중간에 죽어도 잃는 양을 줄이고,
 동시 실행(workers)은 메모리 안전선으로 따로 제한한다."""
 
+import os
+import subprocess
 import shutil
 import sys
 from pathlib import Path
 
-sys.path.insert(0, "src")
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 
 def main() -> None:
-    from data.fineWeb2_preprocess import exact_deduplicate, minhash_deduplicate, preprocess
+    from data.fineWeb2_preprocess import (exact_deduplicate, minhash_deduplicate, preprocess,
+                                         stage, retire_stage, snapshot, read_state, save_state)
 
-    ROOT = Path(".")
+    ROOT = Path(__file__).resolve().parent
     WORK_DIR = ROOT / "data/interim/pretrain"
     SPLIT_INPUT = WORK_DIR / "split_remaining"
     SAVED_8 = WORK_DIR / "_saved_8files"
     SAVED_SHARD = WORK_DIR / "_saved_000_00003"
     PREPROCESSED = WORK_DIR / "preprocessed"
+    MERGED = WORK_DIR / "merged_preprocessed"
+    STATE = WORK_DIR / "pipeline_state"
     EXACT = WORK_DIR / "exact_deduplicated"
     OUTPUT = ROOT / "data/processed/pretrain"
     PREPROCESS_TASKS = 22
@@ -27,33 +32,45 @@ def main() -> None:
 
     print("[1/4] 마지막 2개 샤드(22조각) 전처리 (FTFY + 반복탐지 포함)")
     preprocess(SPLIT_INPUT, PREPROCESSED, PREPROCESS_TASKS, PREPROCESS_WORKERS)
-    shutil.rmtree(SPLIT_INPUT, ignore_errors=True)
-    shutil.rmtree(WORK_DIR / "remaining_raw", ignore_errors=True)
-
-    print("[2/4] 이미 완료된 결과물(8개 + 000_00003 샤드) 합치기")
-    for saved_dir in (SAVED_8, SAVED_SHARD):
-        if saved_dir.exists():
-            for saved_file in sorted(saved_dir.glob("*.jsonl.gz")):
-                dest = PREPROCESSED / saved_file.name
-                shutil.move(str(saved_file), str(dest))
-                print("  merged", saved_file.name)
-            saved_dir.rmdir()
+    print("[2/4] 이미 완료된 결과물 합치기 (원본 보존)")
+    saved_contract = {str(p): snapshot(p) for p in (SAVED_8, SAVED_SHARD)}
+    saved_manifest = STATE / "saved_inputs.json"
+    if saved_manifest.exists() and read_state(saved_manifest) != saved_contract:
+        raise RuntimeError("저장된 샤드 목록이 바뀌었습니다. 새 작업 폴더를 사용하세요.")
+    save_state(saved_manifest, saved_contract)
+    with stage("merge_saved", PREPROCESSED, MERGED, STATE, 1) as logs:
+        if logs is not None:
+            MERGED.mkdir(parents=True, exist_ok=True)
+            for group, source in enumerate((PREPROCESSED, SAVED_8, SAVED_SHARD)):
+                for path in sorted(source.glob("*.jsonl.gz")):
+                    dest = MERGED / f"{group}_{path.name}"
+                    partial = dest.with_suffix(dest.suffix + ".part")
+                    if partial.exists():
+                        partial.unlink()
+                    try:
+                        os.link(path, partial)
+                    except OSError:
+                        shutil.copy2(path, partial)
+                    partial.replace(dest)
 
     print("[3/4] Exact dedup")
-    exact_deduplicate(PREPROCESSED, EXACT, WORK_DIR, DEDUP_TASKS)
-    shutil.rmtree(PREPROCESSED, ignore_errors=True)
-    shutil.rmtree(WORK_DIR / "exact_signatures", ignore_errors=True)
-    shutil.rmtree(WORK_DIR / "exact_duplicates", ignore_errors=True)
+    exact_deduplicate(MERGED, EXACT, WORK_DIR, DEDUP_TASKS, PREPROCESS_WORKERS)
+    retire_stage(STATE, "preprocess", PREPROCESSED)
+    retire_stage(STATE, "merge_saved", MERGED)
+    for name in ("exact_signatures", "exact_duplicates"):
+        shutil.rmtree(WORK_DIR / name, ignore_errors=True)
 
     print("[4/4] MinHash fuzzy dedup")
-    minhash_deduplicate(EXACT, OUTPUT, WORK_DIR, DEDUP_TASKS)
-    shutil.rmtree(WORK_DIR / "minhash_signatures", ignore_errors=True)
-    shutil.rmtree(WORK_DIR / "minhash_buckets", ignore_errors=True)
-    shutil.rmtree(WORK_DIR / "minhash_remove_ids", ignore_errors=True)
-    shutil.rmtree(EXACT, ignore_errors=True)
+    minhash_deduplicate(EXACT, OUTPUT, WORK_DIR, DEDUP_TASKS, PREPROCESS_WORKERS)
+    retire_stage(STATE, "exact", EXACT)
+    for name in ("minhash_signatures", "minhash_buckets", "minhash_remove_ids"):
+        shutil.rmtree(WORK_DIR / name, ignore_errors=True)
 
     print("DONE")
 
 
 if __name__ == "__main__":
+    if os.name == "nt" and os.environ.get("PYTHONUTF8") != "1":
+        os.environ["PYTHONUTF8"] = "1"
+        sys.exit(subprocess.call([sys.executable] + sys.argv, env=os.environ))
     main()

@@ -23,11 +23,16 @@ import argparse
 import gzip
 import json
 import struct
+import sys
 import time
 from array import array
 from pathlib import Path
 
 import sentencepiece as spm
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.utils.artifacts import file_identity, save_state
 
 
 def open_jsonl(path: Path):
@@ -48,10 +53,7 @@ def get_shards(input_dir: Path) -> list[Path]:
 
 def save_json(path: Path, value: dict) -> None:
     """JSON 체크포인트를 임시 파일을 거쳐 안전하게 저장한다."""
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as file:
-        json.dump(value, file, ensure_ascii=False, indent=2)
-    temporary.replace(path)
+    save_state(path, value)
 
 
 def load_json(path: Path) -> dict:
@@ -66,6 +68,8 @@ def tokenize_shard(
     max_documents: int | None = None,
 ) -> dict:
     """하나의 JSONL 샤드를 .bin/.idx로 변환한다."""
+    if max_documents is not None and max_documents <= 0:
+        raise ValueError("max_documents는 양수여야 합니다.")
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = input_path.name.removesuffix(".gz").removesuffix(".jsonl")
     final_bin = output_dir / f"{stem}.bin"
@@ -99,10 +103,11 @@ def tokenize_shard(
             except json.JSONDecodeError:
                 skipped_count += 1
                 continue
-            text = str(record.get("text", "")).strip()
-            if not text:
+            text = record.get("text")
+            if not isinstance(text, str) or not text.strip():
                 skipped_count += 1
                 continue
+            text = text.strip()
 
             token_ids = tokenizer.encode(text, out_type=int)
             token_ids.append(eos_id)
@@ -111,6 +116,8 @@ def tokenize_shard(
 
             # .bin: 토큰 ID를 16비트 정수로 저장한다.
             token_array = array("H", token_ids)
+            if sys.byteorder != "little":
+                token_array.byteswap()
             bin_file.write(token_array.tobytes())
             # .idx: 시작 위치와 문서 토큰 수를 little-endian uint64로 저장한다.
             idx_file.write(struct.pack("<QQ", token_count, len(token_ids)))
@@ -165,29 +172,54 @@ def main() -> None:
     parser.add_argument("--overwrite", action="store_true", help="기존 체크포인트와 결과를 무시하고 새로 시작")
     args = parser.parse_args()
 
+    if args.max_documents is not None and args.max_documents <= 0:
+        parser.error("--max-documents는 양수여야 합니다.")
+
     if not args.tokenizer.exists():
         raise FileNotFoundError(f"토크나이저 파일이 없습니다: {args.tokenizer.resolve()}")
-
-    if args.overwrite and args.checkpoint.exists():
-        args.checkpoint.unlink()
 
     tokenizer = spm.SentencePieceProcessor(model_file=str(args.tokenizer))
     print(f"토크나이저: {args.tokenizer.resolve()}")
     print(f"어휘 크기: {tokenizer.vocab_size():,}")
     print(f"EOS ID: {tokenizer.eos_id()}")
 
-    checkpoint = load_json(args.checkpoint) if args.checkpoint.exists() else {
-        "version": 1,
-        "tokenizer": str(args.tokenizer.resolve()),
-        "splits": {},
+    split_shards = {split: get_shards(args.input_root / split) for split in ("train", "val")}
+    for split, shards in split_shards.items():
+        stems = [p.name.removesuffix(".gz").removesuffix(".jsonl") for p in shards]
+        if len(stems) != len(set(stems)):
+            raise ValueError(f"출력 이름이 중복되는 입력 샤드가 있습니다: {split}")
+    settings = {
+        "tokenizer": file_identity(args.tokenizer),
+        "inputs": {split: [file_identity(p) for p in shards] for split, shards in split_shards.items()},
+        "output_root": str(args.output_root.resolve()),
+        "max_documents": args.max_documents,
     }
+    checkpoint = load_json(args.checkpoint) if args.checkpoint.exists() and not args.overwrite else None
+    if checkpoint is not None:
+        if checkpoint.get("version") != 2 or checkpoint.get("settings") != settings:
+            raise RuntimeError("입력/토크나이저/설정이 다른 체크포인트입니다. 별도 출력 경로나 --overwrite가 필요합니다.")
+    else:
+        if not args.overwrite and any(args.output_root.glob("*/*.bin")):
+            raise FileExistsError("체크포인트 없는 기존 토큰 결과를 덮어쓰지 않습니다.")
+        checkpoint = {"version": 2, "settings": settings, "splits": {}}
+    # 다른 실행의 샤드가 Dataset의 *.bin 검색에 섞이지 않도록 먼저 거부한다.
+    for split, shards in split_shards.items():
+        expected = {p.name.removesuffix(".gz").removesuffix(".jsonl") for p in shards}
+        for path in (args.output_root / split).glob("*"):
+            if path.suffix in (".bin", ".idx") and path.stem not in expected:
+                raise RuntimeError(f"현재 입력에 없는 이전 산출물이 있습니다. 별도 출력 경로를 사용하세요: {path}")
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint["completed"] = False
+    save_json(args.checkpoint, checkpoint)
+    metadata_path = args.output_root / "metadata.json"
+    if metadata_path.exists():
+        metadata_path.unlink()
     all_stats = {}
 
     for split in ("train", "val"):
         input_dir = args.input_root / split
         output_dir = args.output_root / split
-        shards = get_shards(input_dir)
+        shards = split_shards[split]
         completed = checkpoint["splits"].setdefault(split, {})
         print(f"\n[{split}] {len(shards)}개 샤드 처리 시작")
 
@@ -197,7 +229,9 @@ def main() -> None:
             stem = shard.name.removesuffix(".gz").removesuffix(".jsonl")
             final_bin = output_dir / f"{stem}.bin"
             final_idx = output_dir / f"{stem}.idx"
-            if existing and final_bin.exists() and final_idx.exists() and not args.overwrite:
+            if (existing and final_bin.exists() and final_idx.exists() and not args.overwrite
+                    and file_identity(final_bin) == existing.get("bin_identity")
+                    and file_identity(final_idx) == existing.get("idx_identity")):
                 print(f"건너뜀: {shard.name} (체크포인트 완료)")
                 all_stats[f"{split}/{stem}"] = existing
                 continue
@@ -209,6 +243,8 @@ def main() -> None:
                 output_dir=output_dir,
                 max_documents=args.max_documents,
             )
+            stats["bin_identity"] = file_identity(final_bin)
+            stats["idx_identity"] = file_identity(final_idx)
             completed[key] = stats
             all_stats[f"{split}/{stem}"] = stats
             save_json(args.checkpoint, checkpoint)
@@ -222,6 +258,8 @@ def main() -> None:
         "tokenizer": str(args.tokenizer.resolve()),
         "vocab_size": tokenizer.vocab_size(),
         "dtype": "uint16",
+        "byte_order": "little",
+        "settings": settings,
         "index_dtype": "<uint64,uint64",
         "eos_id": tokenizer.eos_id(),
         "shards": all_stats,
