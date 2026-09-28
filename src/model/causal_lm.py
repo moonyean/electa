@@ -79,11 +79,17 @@ class Attention(nn.Module):
         k = k.view(b, s, self.kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(b, s, self.kv_heads, self.head_dim).transpose(1, 2)
         q, k = rotary(q, cos, sin), rotary(k, cos, sin)
-        # CUDA에서는 느린 math fallback을 조용히 사용하지 않는다.
-        backend = SDPBackend.MATH
         if x.is_cuda and self.flash:
-            backend = (SDPBackend.FLASH_ATTENTION if torch.backends.cuda.is_flash_attention_available()
-                       else SDPBackend.CUDNN_ATTENTION)
+            if self.training:
+                # 학습 중에는 CUDA에서 느린 math fallback을 조용히 사용하지 않는다.
+                backend = [SDPBackend.FLASH_ATTENTION if torch.backends.cuda.is_flash_attention_available()
+                           else SDPBackend.CUDNN_ATTENTION]
+            else:
+                # 추론 시엔 짧은 prompt(kv_seqlen=1 등) 커널 제약을 math로 흡수한다.
+                backend = [SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION,
+                           SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+        else:
+            backend = [SDPBackend.MATH]
         with sdpa_kernel(backend):
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True,
                                               dropout_p=0.0, enable_gqa=True)

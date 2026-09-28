@@ -44,8 +44,22 @@ def load_model(checkpoint_dir: Path, model_config_path: Path, device: torch.devi
     return model
 
 
+def _block_repeated_ngrams(logits, ids, no_repeat_ngram_size):
+    """이미 등장한 n-gram이 이어질 다음 토큰의 확률을 -inf로 막는다."""
+    seq = ids[0].tolist()
+    n = no_repeat_ngram_size
+    if len(seq) < n - 1:
+        return logits
+    prefix = tuple(seq[-(n - 1):])
+    banned = {seq[i + n - 1] for i in range(len(seq) - n + 1) if tuple(seq[i:i + n - 1]) == prefix}
+    if banned:
+        logits[:, list(banned)] = float("-inf")
+    return logits
+
+
 @torch.no_grad()
-def generate(model, sp, prompt, device, max_new_tokens=100, temperature=0.8, top_p=0.9):
+def generate(model, sp, prompt, device, max_new_tokens=100, temperature=0.8, top_p=0.9,
+             no_repeat_ngram_size=3):
     ids = sp.encode(prompt, out_type=int)
     ids = torch.tensor([ids], dtype=torch.long, device=device)
     max_len = model.config.sequence_length
@@ -56,6 +70,8 @@ def generate(model, sp, prompt, device, max_new_tokens=100, temperature=0.8, top
         with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=device.type == "cuda"):
             logits = model(context)[:, -1, :]
         logits = logits.float() / max(temperature, 1e-5)
+        if no_repeat_ngram_size > 0:
+            logits = _block_repeated_ngrams(logits, ids, no_repeat_ngram_size)
 
         probs = F.softmax(logits, dim=-1)
         sorted_probs, sorted_idx = torch.sort(probs, descending=True)
@@ -83,6 +99,7 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument("--no-repeat-ngram-size", type=int, default=3)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -100,7 +117,8 @@ def main():
     for prompt in prompts:
         text = generate(model, sp, prompt, device,
                         max_new_tokens=args.max_new_tokens,
-                        temperature=args.temperature, top_p=args.top_p)
+                        temperature=args.temperature, top_p=args.top_p,
+                        no_repeat_ngram_size=args.no_repeat_ngram_size)
         print(f"[prompt] {prompt}")
         print(f"[output] {text}")
         print("-" * 40)
